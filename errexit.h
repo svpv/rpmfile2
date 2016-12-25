@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 
 #define warn_(func, fmt, args...) \
@@ -24,3 +25,17 @@ static inline void *xmalloc_(const char *func, size_t n)
 }
 
 #define xmalloc(n) xmalloc_(__func__, n)
+
+static inline const char *xbasename_(const char *func, const char *fname)
+{
+    const char *bn = strrchr(fname, '/');
+    bn = bn ? bn + 1 : fname;
+    const char *p = bn;
+    while (*p == '.')
+	p++;
+    if (*p == '\0')
+	die_(func, "%s: cannot make basename", fname);
+    return bn;
+}
+
+#define xbasename(fname) xbasename_(__func__, fname)
