@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <assert.h>
 #include <limits.h>
 #include "errexit.h"
 #include "rpmcpio.h"
@@ -13,6 +14,8 @@ struct tmpfile {
     size_t fsize;
     char *mem;
     size_t msize;
+    bool need_file;
+    size_t need_size;
     struct cpioent ent;
     char fname[PATH_MAX];
 };
@@ -23,8 +26,8 @@ struct job {
     pthread_cond_t can_consume;
     bool has_item;
     struct tmpfile *tmpf;
-    void (*proc_fd)(const struct cpioent *ent, int fd, void *arg);
-    void (*proc_mem)(const struct cpioent *ent, char *mem, size_t size, void *arg);
+    void (*proc_buf)(const struct cpioent *ent, const void *buf, size_t size, void *arg);
+    void (*proc_file)(const struct cpioent *ent, int fd, void *arg);
     void *arg;
 };
 
@@ -42,10 +45,18 @@ static void *cpioproc_worker(void *ctx)
 	struct tmpfile *tmpf = job->tmpf;
 	if (tmpf == NULL)
 	    break;
-	if (job->proc_fd)
-	    job->proc_fd(&tmpf->ent, tmpf->fd, job->arg);
-	else
-	    job->proc_mem(&tmpf->ent, tmpf->mem, tmpf->ent.size, job->arg);
+	if (tmpf->need_file) {
+	    assert(job->proc_file);
+	    // full file written
+	    assert(tmpf->fsize == tmpf->ent.size);
+	    job->proc_file(&tmpf->ent, tmpf->fd, job->arg);
+	}
+	else {
+	    assert(job->proc_buf);
+	    // trailing null byte, see below
+	    assert(tmpf->msize > tmpf->need_size);
+	    job->proc_buf(&tmpf->ent, tmpf->mem, tmpf->need_size, job->arg);
+	}
 	job->has_item = 0;
 	err = pthread_cond_signal(&job->can_produce);
 	if (err) die("%s: %s", "pthread_cond_signal", strerror(err));
@@ -71,14 +82,19 @@ static void cpioproc_signal(struct job *job, struct tmpfile *tmpf)
     if (err) die("%s: %s", "pthread_mutex_unlock", strerror(err));
 }
 
-#include <assert.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 
-static void cpioproc_tmpfile(struct tmpfile *tmpf, size_t size, bool need_fd)
+static void cpioproc_tmpfile(struct tmpfile *tmpf, size_t need_size)
 {
+    bool need_file = tmpf->need_file = need_size == ~0U;
+    if (need_size > tmpf->ent.size)
+	need_size = tmpf->ent.size;
+    tmpf->need_size = need_size;
+    assert(need_size > 0);
+    assert(need_size < ~0U);
     if (tmpf->fp) {
-	if (need_fd && lseek(tmpf->fd, 0, 0) < 0)
+	if (need_file && lseek(tmpf->fd, 0, 0) < 0)
 	    die("%s: %m", "lseek");
     }
     else {
@@ -91,27 +107,35 @@ static void cpioproc_tmpfile(struct tmpfile *tmpf, size_t size, bool need_fd)
 	tmpf->msize = 0;
 	tmpf->fsize = 0;
     }
-    // If they need the fd, it must be truncated to the exact size
-    if (tmpf->fsize < size) {
-	int err = posix_fallocate(tmpf->fd, 0, size);
+    // If they need the fd, it must be truncated to the exact size.
+    // Otherwise, add trailing null byte to protect string functions.
+    bool nullbyte = !need_file;
+    if (tmpf->fsize < need_size + nullbyte) {
+	int err = posix_fallocate(tmpf->fd, 0, need_size + nullbyte);
 	if (err) die("%s: %s: posix_fallocate (%zu bytes): %s",
-		     tmpf->ent.rpmbname, tmpf->ent.fname, size, strerror(err));
-	tmpf->fsize = size;
+		     tmpf->ent.rpmbname, tmpf->ent.fname,
+		     need_size + nullbyte, strerror(err));
+	tmpf->fsize = need_size + nullbyte;
     }
-    else if (need_fd && tmpf->fsize > size) {
-	if (ftruncate(tmpf->fd, size) < 0)
+    else if (need_file && tmpf->fsize > need_size) {
+	if (ftruncate(tmpf->fd, need_size) < 0)
 	    die("%s: %m", "ftruncate");
-	tmpf->fsize = size;
+	tmpf->fsize = need_size;
     }
-    if (tmpf->msize >= size)
+    if (tmpf->msize >= need_size + nullbyte) {
+ret:	if (nullbyte)
+	    tmpf->mem[need_size] = '\0';
 	return;
+    }
     if (tmpf->mem && munmap(tmpf->mem, tmpf->msize) < 0)
 	die("%s: %m", "munmap");
-    tmpf->mem = mmap(NULL, size,
+    tmpf->mem = mmap(NULL, need_size + nullbyte,
 	    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, tmpf->fd, 0);
     if (tmpf->mem == MAP_FAILED)
-	die("%s: %s: mmap (%zu bytes): %m", tmpf->ent.rpmbname, tmpf->ent.fname, size);
-    tmpf->msize = size;
+	die("%s: %s: mmap (%zu bytes): %m",
+	    tmpf->ent.rpmbname, tmpf->ent.fname, need_size + nullbyte);
+    tmpf->msize = need_size + nullbyte;
+    goto ret;
 }
 
 static void cpioproc_close_tmpfile(struct tmpfile *tmpf)
@@ -127,10 +151,10 @@ static void cpioproc_close_tmpfile(struct tmpfile *tmpf)
 #include <sys/stat.h>
 #include "cpioproc.h"
 
-static void cpioproc(struct rpmcpio *cpio,
-	bool (*peek)(struct rpmcpio *cpio, const struct cpioent *ent, void *arg),
-	void (*proc_fd)(const struct cpioent *ent, int fd, void *arg),
-	void (*proc_mem)(const struct cpioent *ent, char *mem, size_t size, void *arg),
+void cpioproc(struct rpmcpio *cpio,
+	unsigned (*peek)(struct rpmcpio *cpio, const struct cpioent *ent, void *arg),
+	void (*proc_buf)(const struct cpioent *ent, const void *buf, size_t size, void *arg),
+	void (*proc_file)(const struct cpioent *ent, int fd, void *arg),
 	void *arg)
 {
     const struct cpioent *ent;
@@ -140,13 +164,14 @@ static void cpioproc(struct rpmcpio *cpio,
 	PTHREAD_COND_INITIALIZER,
 	PTHREAD_COND_INITIALIZER,
 	0, NULL,
-	proc_fd, proc_mem, arg,
+	proc_buf, proc_file, arg,
     };
     struct tmpfile tmpff[2];
     tmpff[0].fp = tmpff[1].fp = NULL;
     unsigned nfiles = 0;
     while ((ent = rpmcpio_next(cpio))) {
-	if (!peek(cpio, ent, arg))
+	unsigned size = peek(cpio, ent, arg);
+	if (!size)
 	    continue;
 	if (!S_ISREG(ent->mode)) {
 	    warn("%s: %s: will not process non-regular file", ent->rpmbname, ent->fname);
@@ -165,11 +190,13 @@ static void cpioproc(struct rpmcpio *cpio,
 	// copy ent and fname (will be overwritten on the next iteration)
 	assert(ent->fnamelen < sizeof tmpf->fname);
 	memcpy(&tmpf->ent, ent, sizeof(*ent) + ent->fnamelen + 1);
-	// create or resize tmpfile
-	cpioproc_tmpfile(tmpf, ent->size, proc_fd);
+	// create or resize tmpfile (also handles ~0U case)
+	cpioproc_tmpfile(tmpf, size);
 	// copy file data
-	int n = rpmcpio_read(cpio, tmpf->mem, ent->size + 1);
-	assert(n == (int) ent->size);
+	if (size > ent->size)
+	    size = ent->size;
+	int n = rpmcpio_read(cpio, tmpf->mem, size + (size == ent->size));
+	assert(n == (int) size);
 	// feed to worker
 	cpioproc_signal(&job, tmpf);
     }
@@ -180,20 +207,4 @@ static void cpioproc(struct rpmcpio *cpio,
 	cpioproc_close_tmpfile(&tmpff[0]);
 	cpioproc_close_tmpfile(&tmpff[1]);
     }
-}
-
-void cpioproc_fd(struct rpmcpio *cpio,
-	bool (*peek)(struct rpmcpio *cpio, const struct cpioent *ent, void *arg),
-	void (*proc)(const struct cpioent *ent, int fd, void *arg),
-	void *arg)
-{
-    cpioproc(cpio, peek, proc, NULL, arg);
-}
-
-void cpioproc_mem(struct rpmcpio *cpio,
-	bool (*peek)(struct rpmcpio *cpio, const struct cpioent *ent, void *arg),
-	void (*proc)(const struct cpioent *ent, char *mem, size_t size, void *arg),
-	void *arg)
-{
-    cpioproc(cpio, peek, NULL, proc, arg);
 }
