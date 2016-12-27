@@ -6,8 +6,10 @@
 #include "errexit.h"
 #include "rpmcpio.h"
 
-// We manage two temporary files: while one of them is processed
-// by the worker, the main thread writes another
+// We manage a few temporary files: while one of them is processed
+// by the worker, the main thread writes another.  A temporary file
+// also provides additional information on where it comes from and
+// how it should be processed.
 struct tmpfile {
     FILE *fp;
     int fd;
@@ -20,64 +22,84 @@ struct tmpfile {
     char fname[PATH_MAX];
 };
 
+// Actually we have a small queue of temporary files
+#define NQ 2
+
 struct job {
     pthread_mutex_t mutex;
     pthread_cond_t can_produce;
     pthread_cond_t can_consume;
-    bool has_item;
-    struct tmpfile *tmpf;
+    int nq;
+    struct tmpfile *tmpff[NQ];
     void (*proc_buf)(const struct cpioent *ent, const void *buf, size_t size, void *arg);
     void (*proc_file)(const struct cpioent *ent, int fd, void *arg);
     void *arg;
 };
 
-// The main thread reads cpio, this worker thread processes temporary file
+// The main thread reads cpio, this worker thread processes temporary files
 static void *cpioproc_worker(void *ctx)
 {
     struct job *job = ctx;
-    int err = pthread_mutex_lock(&job->mutex);
-    if (err) die("%s: %s", "pthread_mutex_lock", strerror(err));
     while (1) {
-	while (!job->has_item) {
+	// lock the mutex
+	int err = pthread_mutex_lock(&job->mutex);
+	if (err) die("%s: %s", "pthread_mutex_lock", strerror(err));
+	// wait until something is queued
+	while (job->nq == 0) {
 	    err = pthread_cond_wait(&job->can_consume, &job->mutex);
 	    if (err) die("%s: %s", "pthread_cond_wait", strerror(err));
 	}
-	struct tmpfile *tmpf = job->tmpf;
-	if (tmpf == NULL)
-	    break;
-	if (tmpf->need_file) {
-	    assert(job->proc_file);
-	    // full file written
-	    assert(tmpf->fsize == tmpf->ent.size);
-	    job->proc_file(&tmpf->ent, tmpf->fd, job->arg);
+	// take the jobs from the queue
+	int nq = job->nq;
+	struct tmpfile *tmpff[NQ];
+	memcpy(tmpff, job->tmpff, sizeof tmpff);
+	job->nq = 0;
+	// if they're possibly waiting to produce, let them know
+	if (nq == NQ) {
+	    err = pthread_cond_signal(&job->can_produce);
+	    if (err) die("%s: %s", "pthread_cond_signal", strerror(err));
 	}
-	else {
-	    assert(job->proc_buf);
-	    // trailing null byte, see below
-	    assert(tmpf->msize > tmpf->need_size);
-	    job->proc_buf(&tmpf->ent, tmpf->mem, tmpf->need_size, job->arg);
+	// now can unlock the mutex
+	err = pthread_mutex_unlock(&job->mutex);
+	if (err) die("%s: %s", "pthread_mutex_unlock",  strerror(err));
+	// process the jobs
+	for (int i = 0; i < nq; i++) {
+	    struct tmpfile *tmpf = tmpff[i];
+	    // an exit request?
+	    if (tmpf == NULL)
+		return NULL;
+	    // process the job
+	    if (tmpf->need_file) {
+		assert(job->proc_file);
+		// full file written
+		assert(tmpf->fsize == tmpf->ent.size);
+		job->proc_file(&tmpf->ent, tmpf->fd, job->arg);
+	    }
+	    else {
+		assert(job->proc_buf);
+		// trailing null byte, see below
+		assert(tmpf->msize > tmpf->need_size);
+		job->proc_buf(&tmpf->ent, tmpf->mem, tmpf->need_size, job->arg);
+	    }
 	}
-	job->has_item = 0;
-	err = pthread_cond_signal(&job->can_produce);
-	if (err) die("%s: %s", "pthread_cond_signal", strerror(err));
     }
-    err = pthread_mutex_unlock(&job->mutex);
-    if (err) die("%s: %s", "pthread_mutex_unlock",  strerror(err));
-    return NULL;
 }
 
 static void cpioproc_signal(struct job *job, struct tmpfile *tmpf)
 {
     int err = pthread_mutex_lock(&job->mutex);
     if (err) die("%s: %s", "pthread_mutex_lock", strerror(err));
-    while (job->has_item) {
+    while (job->nq == NQ) {
 	err = pthread_cond_wait(&job->can_produce, &job->mutex);
 	if (err) die("%s: %s", "pthread_cond_wait", strerror(err));
     }
-    job->tmpf = tmpf;
-    job->has_item = 1;
-    err = pthread_cond_signal(&job->can_consume);
-    if (err) die("%s: %s", "pthread_cond_signal", strerror(err));
+    int nq = job->nq;
+    job->tmpff[job->nq++] = tmpf;
+    // if they're possibly waiting to consume, let them know
+    if (nq == 0) {
+	err = pthread_cond_signal(&job->can_consume);
+	if (err) die("%s: %s", "pthread_cond_signal", strerror(err));
+    }
     err = pthread_mutex_unlock(&job->mutex);
     if (err) die("%s: %s", "pthread_mutex_unlock", strerror(err));
 }
@@ -163,11 +185,16 @@ void cpioproc(struct rpmcpio *cpio,
 	PTHREAD_MUTEX_INITIALIZER,
 	PTHREAD_COND_INITIALIZER,
 	PTHREAD_COND_INITIALIZER,
-	0, NULL,
+	0, { NULL, },
 	proc_buf, proc_file, arg,
     };
-    struct tmpfile tmpff[2];
-    tmpff[0].fp = tmpff[1].fp = NULL;
+    // Getting the number of temporary files right is no small matter.
+    // Let's see, the worker can process two files, cpioproc can queue
+    // two more files and be writing yet another one.
+#define NTMP (2 * NQ + 1)
+    struct tmpfile tmpff[NTMP];
+    for (int i = 0; i < NTMP; i++)
+	tmpff[i].fp = NULL;
     unsigned nfiles = 0;
     while ((ent = rpmcpio_next(cpio))) {
 	unsigned size = peek(cpio, ent, arg);
@@ -186,7 +213,7 @@ void cpioproc(struct rpmcpio *cpio,
 	    if (err) die("%s: %s", "pthread_create", strerror(err));
 	}
 	// select tmpfile
-	struct tmpfile *tmpf = &tmpff[nfiles++ % 2];
+	struct tmpfile *tmpf = &tmpff[nfiles++ % NTMP];
 	// copy ent and fname (will be overwritten on the next iteration)
 	assert(ent->fnamelen < sizeof tmpf->fname);
 	memcpy(&tmpf->ent, ent, sizeof(*ent) + ent->fnamelen + 1);
@@ -204,7 +231,7 @@ void cpioproc(struct rpmcpio *cpio,
 	cpioproc_signal(&job, NULL);
 	int err = pthread_join(thread, NULL);
 	if (err) die("%s: %s", "pthread_join", strerror(err));
-	cpioproc_close_tmpfile(&tmpff[0]);
-	cpioproc_close_tmpfile(&tmpff[1]);
+	for (int i = 0; i < NTMP; i++)
+	    cpioproc_close_tmpfile(&tmpff[i]);
     }
 }
