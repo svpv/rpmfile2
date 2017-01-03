@@ -45,7 +45,11 @@ static void proc_file(const struct cpioent *ent, int fd, void *arg)
     if (fd < 0)
 	die("%s: %m", "dup");
     const char *type = magic_descriptor(arg, fd);
+    // avoid the race condition: if magic_descriptor closed the fd,
+    // the fd may have appeared again by now (in another thread)
+#if 0
     close(fd);
+#endif
     if (!type)
 	die("%s: %s: magic failure", ent->rpmbname, ent->fname);
     printf("%s\t%o\t%s\n", ent->fname, ent->mode, type);
