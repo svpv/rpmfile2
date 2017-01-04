@@ -252,6 +252,14 @@ void gen(const char *rpmfname, void **data, size_t *size, void *magic)
     *size = blobsize;
 }
 
+static inline char *oct(unsigned u, char *end)
+{
+    do
+	*--end = '0' + (u & 7);
+    while (u >>= 3);
+    return end;
+}
+
 void put(const char *rpm, void *data0, size_t size, void *arg)
 {
     (void) arg;
@@ -286,16 +294,18 @@ void put(const char *rpm, void *data0, size_t size, void *arg)
     if ((9 + tblobsize + fblobsize) % 2)
 	if (*p++ != '\0')
 	    die("%s: invalid data (pad)", rpm);
-    // put modes
     unsigned short *modes = (void *) p;
     union { unsigned char *t8; unsigned short *t16; } u = { (void *) (modes + nfiles) };
     for (size_t i = 0; i < nfiles; i++) {
-	// terminate filenames with '\t'
-	size_t len = flens[i];
-	files[i][len] = '\t';
-	fwrite(files[i], len + 1, 1, stdout);
+	fwrite(files[i], flens[i], 1, stdout);
 	unsigned mode = modes[i];
-	printf("%o\t", mode);
+	{
+	    char buf[8];
+	    buf[7] = '\t';
+	    char *o = oct(mode, buf + 7);
+	    *--o = '\t';
+	    fwrite(o, buf + 8 - o, 1, stdout);
+	}
 	if (S_ISREG(mode) || S_ISLNK(mode)) {
 	    if ((char *) u.t8 >= blob + size)
 		die("%s: invalid data (type index truncated)", rpm);
