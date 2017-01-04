@@ -260,6 +260,12 @@ static inline char *oct(unsigned u, char *end)
     return end;
 }
 
+#define FWRITE(buf, size)		\
+    do {				\
+	if (fwrite_unlocked(buf, size, 1, stdout) != 1) \
+	    die("fwrite failed");	\
+    } while (0)
+
 void put(const char *rpm, void *data0, size_t size, void *arg)
 {
     (void) arg;
@@ -297,14 +303,14 @@ void put(const char *rpm, void *data0, size_t size, void *arg)
     unsigned short *modes = (void *) p;
     union { unsigned char *t8; unsigned short *t16; } u = { (void *) (modes + nfiles) };
     for (size_t i = 0; i < nfiles; i++) {
-	fwrite(files[i], flens[i], 1, stdout);
+	FWRITE(files[i], flens[i]);
 	unsigned mode = modes[i];
 	{
 	    char buf[8];
 	    buf[7] = '\t';
 	    char *o = oct(mode, buf + 7);
 	    *--o = '\t';
-	    fwrite(o, buf + 8 - o, 1, stdout);
+	    FWRITE(o, buf + 8 - o);
 	}
 	if (S_ISREG(mode) || S_ISLNK(mode)) {
 	    if ((char *) u.t8 >= blob + size)
@@ -316,9 +322,9 @@ void put(const char *rpm, void *data0, size_t size, void *arg)
 		j = *u.t8++;
 	    if (j >= ntypes)
 		die("%s: invalid data (type index)", rpm);
-	    fwrite(types[j], tlens[j] + 1, 1, stdout);
+	    FWRITE(types[j], tlens[j] + 1);
 	}
-#define PRINTLN(s) fwrite(s "\n", sizeof(s), 1, stdout)
+#define PRINTLN(s) FWRITE(s "\n", sizeof(s))
 	else if (S_ISDIR(mode))
 	    PRINTLN("directory");
 	else
