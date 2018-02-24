@@ -144,7 +144,7 @@ static void proc_file(const struct cpioent *ent, int fd, void *a)
 
 void gen(const char *rpmfname, void **data, size_t *size, void *magic)
 {
-    int nent;
+    unsigned nent;
     struct rpmcpio *cpio = rpmcpio_open(rpmfname, &nent);
     if (nent == 0) {
 	assert(cpio == NULL);
