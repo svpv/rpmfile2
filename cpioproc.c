@@ -2,7 +2,6 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <assert.h>
-#include <limits.h>
 #include "errexit.h"
 #include "rpmcpio.h"
 
@@ -19,7 +18,7 @@ struct tmpfile {
     bool need_file;
     size_t need_size;
     struct cpioent ent;
-    char fname[PATH_MAX];
+    char fname[4096];
 };
 
 // Actually we have a small queue of temporary files
@@ -134,8 +133,7 @@ static void cpioproc_tmpfile(struct tmpfile *tmpf, size_t need_size)
     bool nullbyte = !need_file;
     if (tmpf->fsize < need_size + nullbyte) {
 	int err = posix_fallocate(tmpf->fd, 0, need_size + nullbyte);
-	if (err) die("%s: %s: posix_fallocate (%zu bytes): %s",
-		     tmpf->ent.rpmbname, tmpf->ent.fname,
+	if (err) die("%s: posix_fallocate (%zu bytes): %s", tmpf->ent.fname,
 		     need_size + nullbyte, strerror(err));
 	tmpf->fsize = need_size + nullbyte;
     }
@@ -154,8 +152,7 @@ ret:	if (nullbyte)
     tmpf->mem = mmap(NULL, need_size + nullbyte,
 	    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, tmpf->fd, 0);
     if (tmpf->mem == MAP_FAILED)
-	die("%s: %s: mmap (%zu bytes): %m",
-	    tmpf->ent.rpmbname, tmpf->ent.fname, need_size + nullbyte);
+	die("%s: mmap (%zu bytes): %m", tmpf->ent.fname, need_size + nullbyte);
     tmpf->msize = need_size + nullbyte;
     goto ret;
 }
@@ -201,11 +198,11 @@ void cpioproc(struct rpmcpio *cpio,
 	if (!size)
 	    continue;
 	if (!S_ISREG(ent->mode)) {
-	    warn("%s: %s: will not process non-regular file", ent->rpmbname, ent->fname);
+	    warn("%s: will not process non-regular file", ent->fname);
 	    continue;
 	}
 	if (ent->size == 0) {
-	    warn("%s: %s: will not process empty file", ent->rpmbname, ent->fname);
+	    warn("%s: will not process empty file", ent->fname);
 	    continue;
 	}
 	if (nfiles == 0) {

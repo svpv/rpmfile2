@@ -102,7 +102,7 @@ static void proc_buf(const struct cpioent *ent, const void *buf, size_t size, vo
     struct arg *arg = a;
     const char *type = magic_buffer(arg->magic, buf, size);
     if (!type)
-	die("%s: %s: magic failure", ent->rpmbname, ent->fname);
+	die("%s: magic failure", ent->fname);
     putent(ent, type, 0, arg);
 }
 
@@ -120,7 +120,7 @@ static void proc_file(const struct cpioent *ent, int fd, void *a)
     close(fd);
 #endif
     if (!type)
-	die("%s: %s: magic failure", ent->rpmbname, ent->fname);
+	die("%s: magic failure", ent->fname);
     putent(ent, type, 0, arg);
 }
 
