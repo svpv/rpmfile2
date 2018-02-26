@@ -1,13 +1,114 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <assert.h>
+#include <errno.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <magic.h>
 #include <frenc.h>
 #include "rpmcpio.h"
 #include "cpioproc.h"
 #include "cacheproc.h"
+#include "xwrite.h"
 #include "errexit.h"
+
+// Old versions of file(1) look at 256K buffer, modern at 1M.
+#ifdef MAGIC_VERSION
+#define MBUFSIZ (1<<20)
+#else
+#define MBUFSIZ (256<<10)
+#endif
+
+// A buffer backed by a temporary file.
+struct tmpbuf {
+    // Usable as MBUFSIZ, mmap'd.
+    char *buf;
+    // Usable as a file descriptor.
+    int fd;
+    // Where the file is truncated or the last byte written.
+    off_t fsize;
+    // ELF files are sotred in full, otherwise up to MBUFSIZ.
+    bool elf;
+    // Also used as a cpioproc job, need to pass a few cpioent fields.
+    unsigned no;
+    unsigned long long size;
+};
+
+void tmpbuf_init(struct tmpbuf *t)
+{
+    t->fd = memfd_create("tmpbuf", 0);
+    if (t->fd < 0) {
+	if (errno != ENOSYS)
+	    die("%s: %m", "memfd_create");
+	FILE *fp = tmpfile();
+	if (!fp)
+	    die("%s: %m", "tmpfile");
+	int fd = fileno(fp);
+	assert(fd >= 0);
+	fd = dup(fd);
+	if (fd < 0)
+	    die("%s: %m", "dup");
+	fclose(fp);
+    }
+    t->buf = mmap(NULL, MBUFSIZ, PROT_READ | PROT_WRITE, MAP_SHARED, t->fd, 0);
+    if (t->buf == MAP_FAILED)
+	die("%s: %m", "mmap");
+    // The mmaped are cannot be accessed just yet, the file will be upsized
+    // to at least MBUFSIZ bytes on the first call to tmpbuf_fill.
+    t->fsize = 0;
+}
+
+void tmpbuf_close(struct tmpbuf *t)
+{
+    if (close(t->fd) < 0)
+	die("%s: %m", "close");
+    if (munmap(t->buf, MBUFSIZ) < 0)
+	die("%s: %m", "munmap");
+    t->buf = NULL;
+}
+
+void tmpbuf_fill(struct tmpbuf *t, struct rpmcpio *cpio, const struct cpioent *ent)
+{
+    // The first part can be copied directly into the mmap'd buffer.
+    size_t part1 = ent->size < MBUFSIZ ? ent->size : MBUFSIZ;
+    if (t->fsize < part1) {
+	if (ftruncate(t->fd, MBUFSIZ) < 0)
+	    die("%s: %m", "ftruncate");
+	t->fsize = MBUFSIZ;
+    }
+    rpmcpio_read(cpio, t->buf, part1);
+    // With size > 5, file(1) has a special ELF processing routine
+    // which needs the whole file content on a file descriptor.
+    bool elf = part1 > 5 && memcmp(t->buf, "\177ELF", 4) == 0;
+    if (elf) {
+	// For ELF, there may be part two to write on fd.
+	if (ent->size > MBUFSIZ) {
+	    if (lseek(t->fd, MBUFSIZ, SEEK_SET) < 0)
+		die("%s: %m", "lseek");
+	    char buf[BUFSIZ];
+	    size_t size;
+	    while ((size = rpmcpio_read(cpio, buf, sizeof buf)))
+		if (!xwrite(t->fd, buf, size))
+		    die("%s: %m", "write");
+	}
+	// File size should match directly, may need to curtail.
+	if (t->fsize > ent->size)
+	    if (ftruncate(t->fd, ent->size) < 0)
+		die("%s: %m", "ftruncate");
+	t->fsize = ent->size;
+	// Rewrind to the beginning.
+	if (lseek(t->fd, 0, 0) < 0)
+	    die("%s: %m", "lseek");
+    }
+    t->elf = elf;
+    t->no = ent->no;
+    t->size = ent->size;
+}
+
+// We have a small queue of jobs, each job needs a temporary buffer.
+// Besides, the producer and consumer each need an additional temporary buffer.
+#define NTMP (CPIOPROC_NQ+2)
+struct tmpbuf g_tmpbuf[NTMP];
 
 // file+type entry
 struct ft {
@@ -21,61 +122,70 @@ struct ft {
 // passed around when generating the record for a package
 struct arg {
     magic_t magic;
+    // tmpbuf sequence/counter
+    unsigned ntmp;
     // ft[i] can be accessed without locking, provided that
     // the thread knows its beforehand (i.e. uses ent->no)
     struct ft ft[];
 };
 
-// put a file+type entry into the table
-static void putent(const struct cpioent *ent, const char *type, bool consttype, struct arg *arg)
+// cpioproc callback
+static void *peek(struct rpmcpio *cpio, const struct cpioent *ent, void *a)
 {
-    size_t flen = strlen(ent->fname);
-    char *name;
-    if (consttype)
-	name = xmalloc(flen + 1);
-    else {
-	size_t tlen = strlen(type);
-	name = xmalloc(flen + tlen + 2);
-	type = memcpy(name + flen + 1, type, tlen + 1);
+    struct arg *arg = a;
+    struct ft *f = &arg->ft[ent->no];
+    f->name = memcpy(xmalloc(ent->fnamelen + 1), ent->fname, ent->fnamelen + 1);
+    f->mode = ent->mode;
+    // file(1) only really looks at size > 1.
+    if (S_ISREG(ent->mode) && ent->size > 1) {
+	// Offloading tmpbuf as a job for cpioproc.
+	struct tmpbuf *t = &g_tmpbuf[arg->ntmp++ % NTMP];
+	if (!t->buf)
+	    tmpbuf_init(t);
+	tmpbuf_fill(t, cpio, ent);
+	return t;
     }
-    memcpy(name, ent->fname, flen + 1);
-    // only ft->name has been allocated (and should be freed)
-    arg->ft[ent->no] = (struct ft) { name, type, ent->mode, 0, 0 };
+    // Regular files and hardlinks always have types (stored in
+    // rpmfile records); other kinds of files never have types.
+    if (S_ISREG(ent->mode)) {
+	if (ent->size == 0)
+	    f->type = "empty";
+	else
+	    f->type = "very short file (no magic)";
+    }
+    else if (S_ISLNK(ent->mode)) // TODO: readlink
+	f->type = "symbolic link";
+    else {
+	f->type = NULL;
+	return NULL;
+    }
+    size_t len = strlen(f->type);
+    f->type = memcpy(xmalloc(len + 1), f->type, len + 1);
+    return NULL;
 }
 
-static unsigned peek(struct rpmcpio *cpio, const struct cpioent *ent, void *arg)
+// cpioproc callback, handles offloaded jobs
+static void proc(void *tmpbuf, void *a)
 {
-    // file(1) only really looks at size > 1
-    if (!(S_ISREG(ent->mode) && ent->size > 1)) {
-	// Regular files and hardlinks always have types (stored in
-	// rpmfile records); other kinds of files never have types.
-	if (S_ISREG(ent->mode)) {
-	    if (ent->size == 0)
-		putent(ent, "empty", 1, arg);
-	    else
-		putent(ent, "very short file (no magic)", 1, arg);
-	}
-	else if (S_ISLNK(ent->mode))
-	    putent(ent, "symbolic link", 1, arg);
-	else
-	    putent(ent, NULL, 1, arg);
-	return 0;
+    struct tmpbuf *t = tmpbuf;
+    struct arg *arg = a;
+    const char *type;
+    if (t->elf) {
+	// magic_descriptor closes the fd.
+	int fd = dup(t->fd);
+	if (fd < 0)
+	    die("%s: %m", "dup");
+	type = magic_descriptor(arg->magic, fd);
     }
-    // with size > 5, file(1) has special ELF processing routine
-    // which requires the whole file with the file descriptor
-    if (ent->size > 5) {
-	char buf[4];
-	int n = rpmcpio_peek(cpio, buf, 4);
-	assert(n == 4);
-	if (memcmp(buf, "\177ELF", 4) == 0)
-	    return ~0U;
+    else {
+	size_t size = t->size < MBUFSIZ ? t->size : MBUFSIZ;
+	type = magic_buffer(arg->magic, t->buf, size);
     }
-    // older versions of file(1) look at 256K buffer, modern at 1M
-#ifdef MAGIC_VERSION
-    if (magic_version() >= 523)
-	return 1 << 20;
-#endif
-    return 256 << 10;
+    struct ft *f = &arg->ft[t->no];
+    if (!type)
+	die("%s: magic failure", f->name);
+    size_t tlen = strlen(type);
+    f->type = memcpy(xmalloc(tlen + 1), type, tlen + 1);
 }
 
 static int namecmp(const void *a1, const void *a2)
@@ -95,33 +205,6 @@ static int typecmp(const void *a1, const void *a2)
     else if (ft2->type == NULL)
 	return -1;
     return strcmp(ft1->type, ft2->type);
-}
-
-static void proc_buf(const struct cpioent *ent, const void *buf, size_t size, void *a)
-{
-    struct arg *arg = a;
-    const char *type = magic_buffer(arg->magic, buf, size);
-    if (!type)
-	die("%s: magic failure", ent->fname);
-    putent(ent, type, 0, arg);
-}
-
-static void proc_file(const struct cpioent *ent, int fd, void *a)
-{
-    struct arg *arg = a;
-    // magic_descriptor can close fd
-    fd = dup(fd);
-    if (fd < 0)
-	die("%s: %m", "dup");
-    const char *type = magic_descriptor(arg->magic, fd);
-    // avoid the race condition: if magic_descriptor closed the fd,
-    // the fd may have appeared again by now (in another thread)
-#if 0
-    close(fd);
-#endif
-    if (!type)
-	die("%s: magic failure", ent->fname);
-    putent(ent, type, 0, arg);
 }
 
 // rpmfile record format
@@ -153,8 +236,9 @@ void gen(const char *rpmfname, void **data, size_t *size, void *magic)
     struct arg *arg = xmalloc(sizeof(*arg) + (nent + 1) * sizeof *arg->ft);
     struct ft *ft = arg->ft;
     arg->magic = magic;
+    arg->ntmp = 0;
     memset(ft, 0, (nent + 1) * sizeof *ft);
-    cpioproc(cpio, peek, proc_buf, proc_file, arg);
+    cpioproc(cpio, peek, proc, arg);
     rpmcpio_close(cpio);
     // actual number of entries can be smaller
     for (struct ft *p = ft; ; p++)

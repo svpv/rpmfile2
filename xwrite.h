@@ -1,4 +1,4 @@
-// Copyright (c) 2016, 2018 Alexey Tourbin
+// Copyright (c) 2017 Alexey Tourbin
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -18,21 +18,37 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#pragma once
+#include <stdbool.h>
+#include <assert.h>
+#include <unistd.h>
+#include <errno.h>
 
-// rpmcpio.h
-struct rpmcpio;
-struct cpioent;
+// Writes exactly size bytes.
+static bool xwrite(int fd, const void *buf, size_t size)
+{
+    assert(size);
+    bool zero = false;
+    do {
+	ssize_t ret = write(fd, buf, size);
+	if (ret < 0) {
+	    if (errno == EINTR)
+		continue;
+	    return false;
+	}
+	if (ret == 0) {
+	    if (zero) {
+		// write keeps returning zero
+		errno = EAGAIN;
+		return false;
+	    }
+	    zero = true;
+	    continue;
+	}
+	zero = false;
+	assert(ret <= size);
+	buf = (char *) buf + ret;
+	size -= ret;
+    } while (size);
 
-// Process cpio entries.
-// Heavy processing operations can be offloaded to a separate thread.
-// Moreover, the processor maintains a small queue of offloaded jobs.
-#define CPIOPROC_NQ 4
-
-void cpioproc(struct rpmcpio *cpio,
-	// Called for each entry.  If an entry is heavy, it can be
-	// packaged into and returned as a "job" for further processing.
-	void *(*peek)(struct rpmcpio *cpio, const struct cpioent *ent, void *arg),
-	// Called in another thread to process the jobs returned by peek().
-	void (*proc)(void *job, void *arg),
-	void *arg);
+    return true;
+}
