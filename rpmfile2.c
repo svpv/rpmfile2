@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <magic.h>
@@ -232,9 +233,9 @@ static int typecmp(const void *a1, const void *a2)
 void gen(const char *rpmfname, void **data, size_t *size, void *magic)
 {
     unsigned nent;
-    struct rpmcpio *cpio = rpmcpio_open(rpmfname, &nent);
+    struct rpmcpio *cpio = rpmcpio_open(AT_FDCWD, rpmfname, &nent, false);
     if (nent == 0) {
-	assert(cpio == NULL);
+	rpmcpio_close(cpio);
 	return;
     }
     struct arg *arg = xmalloc(sizeof(*arg) + (nent + 1) * sizeof *arg->ft);
