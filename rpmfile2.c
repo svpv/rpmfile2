@@ -100,6 +100,10 @@ void tmpbuf_fill(struct tmpbuf *t, struct rpmcpio *cpio, const struct cpioent *e
 	if (lseek(t->fd, 0, 0) < 0)
 	    die("%s: %m", "lseek");
     }
+    // If it's a buffer after a file, consider saving some memory.
+    else if (t->fsize > 2 * MBUFSIZ)
+	if (ftruncate(t->fd, MBUFSIZ) == 0)
+	    t->fsize = MBUFSIZ;
     t->elf = elf;
     t->no = ent->no;
     t->size = ent->size;
