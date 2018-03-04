@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <assert.h>
+#include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -158,8 +159,11 @@ static void *peek(struct rpmcpio *cpio, const struct cpioent *ent, void *a)
 	else
 	    f->type = "very short file (no magic)";
     }
-    else if (S_ISLNK(ent->mode)) // TODO: readlink
-	f->type = "symbolic link";
+    else if (S_ISLNK(ent->mode)) {
+	char *buf = alloca(ent->size + 1);
+	rpmcpio_readlink(cpio, buf, ent->size + 1);
+	f->type = buf;
+    }
     else {
 	f->type = NULL;
 	return NULL;
@@ -411,6 +415,10 @@ void put(const char *rpm, void *data0, size_t size, void *arg)
 		j = *u.t8++;
 	    if (j >= ntypes)
 		die("%s: invalid data (type index)", rpm);
+	    if (S_ISLNK(mode)) {
+		const char S[] = "symbolic link to ";
+		FWRITE(S, sizeof S - 1);
+	    }
 	    FWRITE(types[j], tlens[j] + 1);
 	}
 #define PRINTLN(s) FWRITE(s "\n", sizeof(s))
