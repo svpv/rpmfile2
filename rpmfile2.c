@@ -1,7 +1,9 @@
+#include <stdio.h>
 #include <stdbool.h>
-#include <unistd.h>
+#include <string.h>
 #include <assert.h>
 #include <errno.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
