@@ -13,6 +13,11 @@
 #include "xwrite.h"
 #include "errexit.h"
 
+#if 100*__GLIBC__+__GLIBC_MINOR__ < 227
+#include <sys/syscall.h>
+#define memfd_create(name, flags) syscall(__NR_memfd_create, name, flags)
+#endif
+
 // Old versions of file(1) look at 256K buffer, modern at 1M.
 #ifdef MAGIC_VERSION
 #define MBUFSIZ (1<<20)
