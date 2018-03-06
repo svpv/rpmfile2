@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <getopt.h>
 #include <magic.h>
 #include <rpmcpio.h>
 #include "cpioproc.h"
@@ -358,6 +359,13 @@ static inline void printbuf(const void *buf, size_t size)
 	die("%s: %m", "fwrite");
 }
 
+// Print a single character to stdout.
+static inline void printchar(unsigned char c)
+{
+    if (putchar_unlocked(c) != c)
+	die("%s: %m", "putchar");
+}
+
 // Format a 6-digit octal number.
 static inline void oct6(unsigned u, char o[6])
 {
@@ -369,20 +377,27 @@ static inline void oct6(unsigned u, char o[6])
     o[5] = '0' + ((u >>  0) & 7);
 }
 
+// Whether to print the middle column with file mode.
+int opt_no_mode;
+
 // Print a single entry.
 void print1(struct ft *f)
 {
     if (f->dn)
 	printbuf(f->dn, f->dlen);
     printbuf(f->bn, f->blen);
-    // Octal mode - 5 or 6 characters, surrounded by '\t'.
-    char obuf[8];
-    oct6(f->mode, obuf + 1);
-    // Skip the leading zero, if there is one.
-    char *o = obuf + (obuf[1] == '0');
-    size_t olen = 8 - (obuf[1] == '0');
-    *o = obuf[7] = '\t';
-    printbuf(o, olen);
+    if (opt_no_mode)
+	printchar('\t');
+    else {
+	// Octal mode - 5 or 6 characters, surrounded by '\t'.
+	char obuf[8];
+	oct6(f->mode, obuf + 1);
+	// Skip the leading zero, if there is one.
+	char *o = obuf + (obuf[1] == '0');
+	size_t olen = 8 - (obuf[1] == '0');
+	*o = obuf[7] = '\t';
+	printbuf(o, olen);
+    }
     // deal with type
 #define SDIR "directory"
 #define SOTH "other"
@@ -392,26 +407,16 @@ void print1(struct ft *f)
 	printbuf(SDIR, sizeof SDIR - 1);
     else
 	printbuf(SOTH, sizeof SOTH - 1);
-    if (putchar_unlocked('\n') != '\n')
-	die("%s: %m", "putchar");
+    printchar('\n');
 }
 
-void rpmfile(const char *rpmfname)
+void rpmfile(struct rpmcpio *cpio, unsigned nent, const char *rpmbname)
 {
-    unsigned nent;
-    struct rpmcpio *cpio = rpmcpio_open(AT_FDCWD, rpmfname, &nent, false);
-    if (nent == 0) {
-	rpmcpio_close(cpio);
-	return;
-    }
-    const char *rpmbname = strrchr(rpmfname, '/');
-    rpmbname = rpmbname ? rpmbname + 1 : rpmfname;
     struct ft *ft = reallocarray(NULL, nent, sizeof *ft);
     if (!ft)
 	die("%s: cannot allocate %u file+type entries", rpmbname, nent);
     struct ctx ctx = { rpmbname, 0, 0, { 0, 0 }, ft };
     cpioproc(cpio, peek, proc, &ctx);
-    rpmcpio_close(cpio);
     nent = ctx.nent;
     // Sort by filename.
     sort(rpmbname, ft, nent);
@@ -428,15 +433,49 @@ void rpmfile(const char *rpmfname)
     free(ft);
 }
 
+// Whether to list unpackaged files found only in the header.
+int opt_all;
+
 int main(int argc, char **argv)
 {
-    if (argc < 2)
-	die("usage: rpmfile file.rpm...");
+    enum { OPT_HELP = 256 };
+    static const struct option longopts[] = {
+	{ "help", no_argument, NULL, OPT_HELP },
+	{ "no-mode", no_argument, &opt_no_mode, 1 },
+	{ "all", no_argument, &opt_all, 1 },
+	{ NULL },
+    };
+    bool usage = false;
+    int c;
+    while ((c = getopt_long(argc, argv, "", longopts, NULL)) != -1)
+	if (c)
+	    usage = true;
+    if (usage) {
+usage:	fprintf(stderr, "Usage: " PROG " file.rpm...\n");
+	return 1;
+    }
+    argc -= optind, argv += optind;
+    if (argc < 1) {
+	warn("not enough arguments");
+	goto usage;
+    }
     g_magic = magic_open(0);
     if (!g_magic || magic_load(g_magic, NULL) < 0)
 	die("cannot load magic db");
-    for (int i = 1; i < argc; i++)
-	rpmfile(argv[i]);
+    // XXX --all is not yet supported properly
+    opt_all = 0;
+    // XXX rpmcpio_reopen is not yet implemented
+    for (int i = 0; i < argc; i++) {
+	const char *rpmfname = argv[i];
+	unsigned nent;
+	struct rpmcpio *cpio = rpmcpio_open(AT_FDCWD, rpmfname, &nent, opt_all);
+	if (nent) {
+	    const char *rpmbname = strrchr(rpmfname, '/');
+	    rpmbname = rpmbname ? rpmbname + 1 : rpmfname;
+	    rpmfile(cpio, nent, rpmbname);
+	}
+	rpmcpio_close(cpio);
+    }
     if (fflush(stdout) != 0)
 	die("%s: %m", "fflush");
     magic_close(g_magic);
