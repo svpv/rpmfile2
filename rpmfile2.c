@@ -8,7 +8,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <magic.h>
-#include "rpmcpio.h"
+#include <rpmcpio.h>
 #include "cpioproc.h"
 #include "xwrite.h"
 #include "errexit.h"
@@ -33,7 +33,7 @@ struct tmpbuf {
     int fd;
     // Where the file is truncated or the last byte written.
     off_t fsize;
-    // ELF files are sotred in full, otherwise up to MBUFSIZ.
+    // ELF files are stored in full, otherwise up to MBUFSIZ.
     bool elf;
     // Also used as a cpioproc job, need to pass a few cpioent fields.
     unsigned no;
@@ -59,7 +59,7 @@ void tmpbuf_init(struct tmpbuf *t)
     t->buf = mmap(NULL, MBUFSIZ, PROT_READ | PROT_WRITE, MAP_SHARED, t->fd, 0);
     if (t->buf == MAP_FAILED)
 	die("%s: %m", "mmap");
-    // The mmaped are cannot be accessed just yet, the file will be upsized
+    // The mmap'd area cannot be accessed just yet, the file will be upsized
     // to at least MBUFSIZ bytes on the first call to tmpbuf_fill.
     t->fsize = 0;
 }
@@ -102,7 +102,7 @@ void tmpbuf_fill(struct tmpbuf *t, struct rpmcpio *cpio, const struct cpioent *e
 	    if (ftruncate(t->fd, ent->size) < 0)
 		die("%s: %m", "ftruncate");
 	t->fsize = ent->size;
-	// Rewrind to the beginning.
+	// Rewind to the beginning.
 	if (lseek(t->fd, 0, 0) < 0)
 	    die("%s: %m", "lseek");
     }
@@ -123,7 +123,7 @@ struct tmpbuf g_tmpbuf[NTMP];
 // The global libmagic handle, only used in the cpioproc thread.
 magic_t g_magic;
 
-// A signle classified cpio entry, file+type.
+// A single classified cpio entry, file+type.
 struct ft {
     char *bn;
     char *dn;
@@ -245,18 +245,16 @@ static void *peek(struct rpmcpio *cpio, const struct cpioent *ent, void *arg)
 	t->no = no;
 	return t;
     }
-    // For regulare files, a distinction still remains between empty and
+    // For regular files, a distinction still remains between empty and
     // non-empty files (the file size is no longer available at print time).
     if (S_ISREG(ent->mode)) {
-#define S0 "empty"
-#define S1 "very short file (no magic)"
+	static char S0[] = "empty";
+	static char S1[] = "very short file (no magic)";
 	if (ent->size == 0)
 	    f->type = S0, f->tlen = sizeof S0 - 1;
 	else
 	    f->type = S1, f->tlen = sizeof S1 - 1;
 	f->talloc = false;
-#undef S0
-#undef S1
     }
     // For symbolic links, will need to print the target.
     else if (S_ISLNK(ent->mode)) {
