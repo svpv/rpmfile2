@@ -138,6 +138,8 @@ struct ctx {
     unsigned nent;
     // tmpbuf sequence/counter
     unsigned njob;
+    // hardlink state
+    struct { unsigned no; unsigned cnt; } hard;
     // ft[i] can be accessed without locking, provided that
     // the thread knows its index beforehand (i.e. uses ent->no)
     struct ft *ft;
@@ -176,6 +178,58 @@ static void *peek(struct rpmcpio *cpio, const struct cpioent *ent, void *arg)
     }
     f->bn = bn, f->blen = blen;
     f->dn = dn, f->dlen = dlen;
+    // Handle hardlink sets.
+    unsigned no = ent->no;
+    if (!S_ISDIR(ent->mode) && ent->nlink > 1) {
+	// The first hardlink in a set?
+	if (ctx->hard.cnt == 0) {
+	    ctx->hard.cnt = ent->nlink - 1;
+	    ctx->hard.no = no;
+	    return NULL;
+	}
+	// Non-last hardlink in a set?
+	if (--ctx->hard.cnt)
+	    return NULL;
+	// The last hardlink in a set.  Classify all hardlinks in a set
+	// following the first one as "hard link to [the first hardlink]".
+	// When dirname is the same, the target shown will be relative.
+	struct ft *f0 = &ctx->ft[ctx->hard.no];
+	char *tabs = NULL, *trel = NULL;
+	unsigned labs = 0, lrel = 0;
+	for (unsigned i = ctx->hard.no + 1; i <= no; i++) {
+	    struct ft *fi = &ctx->ft[i];
+	    static const char HARD[] = "hard link to ";
+	    if (f0->dn == fi->dn) {
+		if (trel)
+		    fi->talloc = false;
+		else {
+		    lrel = sizeof HARD - 1 + f0->blen;
+		    trel = memcpy(xmalloc(lrel + 1), HARD, sizeof HARD - 1);
+		    memcpy(trel + sizeof HARD - 1, f0->bn, f0->blen + 1);
+		    fi->talloc = true;
+		}
+		fi->type = trel, fi->tlen = lrel;
+	    }
+	    else {
+		if (tabs)
+		    fi->talloc = false;
+		else {
+		    labs = sizeof HARD - 1 + f0->dlen + f0->blen;
+		    tabs = memcpy(xmalloc(labs + 1), HARD, sizeof HARD - 1);
+		    memcpy(tabs + sizeof HARD - 1, f0->dn, f0->dlen);
+		    memcpy(tabs + sizeof HARD - 1 + f0->dlen, f0->bn, f0->blen + 1);
+		    fi->talloc = true;
+		}
+		fi->type = tabs, fi->tlen = labs;
+	    }
+	}
+	// The data coming from the last hardlink is about to be classified,
+	// but the result will be put in the first hardlink's slot.
+	no = ctx->hard.no;
+	f = &ctx->ft[no];
+	// The state of hardlink was reset with --ctx->hard.cnt.  The rpmcpio
+	// library performs all the necessary validation of hardlink sets.
+    }
     // file(1) only really looks at size > 1.
     if (S_ISREG(ent->mode) && ent->size > 1) {
 	// Offloading tmpbuf as a job for cpioproc.
@@ -183,6 +237,7 @@ static void *peek(struct rpmcpio *cpio, const struct cpioent *ent, void *arg)
 	if (!t->buf)
 	    tmpbuf_init(t);
 	tmpbuf_fill(t, cpio, ent);
+	t->no = no;
 	return t;
     }
     // For regulare files, a distinction still remains between empty and
@@ -200,9 +255,11 @@ static void *peek(struct rpmcpio *cpio, const struct cpioent *ent, void *arg)
     }
     // For symbolic links, will need to print the target.
     else if (S_ISLNK(ent->mode)) {
-	char *buf = xmalloc(ent->size + 1);
-	rpmcpio_readlink(cpio, buf, ent->size + 1);
-	f->type = buf, f->tlen = ent->size, f->talloc = true;
+	static const char S[] = "symbolic link to ";
+	f->tlen = sizeof S - 1 + ent->size;
+	char *buf = memcpy(xmalloc(f->tlen + 1), S, sizeof S - 1);
+	rpmcpio_readlink(cpio, buf + sizeof S - 1, ent->size + 1);
+	f->type = buf, f->talloc = true;
     }
     else // File type deducible from ent->mode at print time.
 	f->type = NULL, f->tlen = 0, f->talloc = false;
@@ -324,11 +381,8 @@ void print1(struct ft *f)
     *o = obuf[7] = '\t';
     printbuf(o, olen);
     // deal with type
-#define SLNK "symbolic link to "
 #define SDIR "directory"
 #define SOTH "other"
-    if (S_ISLNK(f->mode))
-	printbuf(SLNK, sizeof SLNK - 1);
     if (f->type)
 	printbuf(f->type, f->tlen);
     else if (S_ISDIR(f->mode))
@@ -352,7 +406,7 @@ void rpmfile(const char *rpmfname)
     struct ft *ft = reallocarray(NULL, nent, sizeof *ft);
     if (!ft)
 	die("%s: cannot allocate %u file+type entries", rpmbname, nent);
-    struct ctx ctx = { rpmbname, 0, 0, ft };
+    struct ctx ctx = { rpmbname, 0, 0, { 0, 0 }, ft };
     cpioproc(cpio, peek, proc, &ctx);
     rpmcpio_close(cpio);
     nent = ctx.nent;
