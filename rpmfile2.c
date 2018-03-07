@@ -323,14 +323,30 @@ static inline int strlencmp(const char *s1, size_t len1, const char *s2, size_t 
 static inline int fnamecmp(const char *rpmbname, struct ft *f1, struct ft *f2)
 {
     assert(!f1->dn ^ !!f2->dn); // both dirnames are NULL, or both non-NULL
-    if (f1->dn != f2->dn) {
-	int cmp = strlencmp(f1->dn, f1->dlen, f2->dn, f2->dlen);
-	if (cmp)
-	    return cmp;
+    if (f1->dlen == f2->dlen) {
+	if (f1->dn != f2->dn) {
+	    int cmp = memcmp(f1->dn, f2->dn, f1->dlen);
+	    if (cmp) return cmp;
+	}
+	int cmp = strlencmp(f1->bn, f1->blen, f2->bn, f2->blen);
+	if (cmp == 0)
+	    die("%s: %s%s: filename dup", rpmbname, f1->dn ? f1->dn : "", f1->bn);
+	return cmp;
     }
-    int cmp = strlencmp(f1->bn, f1->blen, f2->bn, f2->blen);
-    if (cmp == 0)
-	die("%s: %s%s: filename dup", rpmbname, f1->dn ? f1->dn : "", f1->bn);
+    // Dirname lengths are different.
+    // Compare the rest of the longer dirname with the other basename.
+    int cmp;
+    if (f1->dlen < f2->dlen) {
+	cmp = memcmp(f1->dn, f2->dn, f1->dlen);
+	if (cmp) return cmp;
+	cmp = strlencmp(f1->bn, f1->blen, f2->dn + f1->dlen, f2->dlen - f1->dlen);
+    }
+    else {
+	cmp = memcmp(f1->dn, f2->dn, f2->dlen);
+	if (cmp) return cmp;
+	cmp = strlencmp(f1->dn + f2->dlen, f1->dlen - f2->dlen, f2->bn, f2->blen);
+    }
+    assert(cmp);
     return cmp;
 }
 
