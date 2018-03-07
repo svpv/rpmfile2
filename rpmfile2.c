@@ -399,14 +399,32 @@ void print1(struct ft *f)
 	printbuf(o, olen);
     }
     // deal with type
-#define SDIR "directory"
-#define SOTH "other"
     if (f->type)
 	printbuf(f->type, f->tlen);
-    else if (S_ISDIR(f->mode))
-	printbuf(SDIR, sizeof SDIR - 1);
-    else
-	printbuf(SOTH, sizeof SOTH - 1);
+    else if (S_ISDIR(f->mode)) {
+	const char S[] = "directory";
+	printbuf(S, sizeof S - 1);
+    }
+    else if (S_ISCHR(f->mode)) {
+	const char S[] = "character special";
+	printbuf(S, sizeof S - 1);
+    }
+    else if (S_ISBLK(f->mode)) {
+	const char S[] = "block special";
+	printbuf(S, sizeof S - 1);
+    }
+    else if (S_ISFIFO(f->mode)) {
+	const char S[] = "fifo (named pipe)";
+	printbuf(S, sizeof S - 1);
+    }
+    else if (S_ISSOCK(f->mode)) {
+	const char S[] = "socket";
+	printbuf(S, sizeof S - 1);
+    }
+    else {
+	const char S[] = "invalid mode";
+	printbuf(S, sizeof S - 1);
+    }
     printchar('\n');
 }
 
