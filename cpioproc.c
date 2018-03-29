@@ -81,7 +81,7 @@ static void *cpioproc_recv(struct ctx *ctx)
     return j;
 }
 
-// The worker thread routine, processes the job.
+// The worker thread routine, processes the jobs.
 static void *cpioproc_worker(void *arg)
 {
     struct ctx *ctx = arg;

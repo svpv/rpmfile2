@@ -1,4 +1,4 @@
-# rpmfile2 - files+type in .rpm packages
+# rpmfile2 - files+types in .rpm packages
 
 The `rpmfile2` program lists filenames, along with their magic types,
 as determined by `file(1)`, in `.rpm` packages.  This is a reimplementation
