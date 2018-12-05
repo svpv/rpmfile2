@@ -11,6 +11,7 @@
 #include <magic.h>
 #include <rpmcpio.h>
 #include "cpioproc.h"
+#include "qsort.h"
 #include "xwrite.h"
 #include "errexit.h"
 
@@ -322,7 +323,6 @@ static inline int strlencmp(const char *s1, size_t len1, const char *s2, size_t 
 // Compare ft[] filenames for the sort routine.
 static inline int fnamecmp(const char *rpmbname, struct ft *f1, struct ft *f2)
 {
-    assert(!f1->dn ^ !!f2->dn); // both dirnames are NULL, or both non-NULL
     if (f1->dlen == f2->dlen) {
 	if (f1->dn != f2->dn) {
 	    int cmp = memcmp(f1->dn, f2->dn, f1->dlen);
@@ -350,22 +350,21 @@ static inline int fnamecmp(const char *rpmbname, struct ft *f1, struct ft *f2)
     return cmp;
 }
 
-// Sort ft[] by filename.  Insertion sort should suffice, because filenames
-// are "almost sorted" (only hard links are grouped at the end of payload).
+// Sort ft[] by filename.
 void sort(const char *rpmbname, struct ft ft[], size_t n)
 {
-    // For each item starting with the second...
-    for (size_t i = 1; i < n; i++) {
-	if (fnamecmp(rpmbname, &ft[i-1], &ft[i]) < 0)
-	    continue;
-	// move it down the array so that the first part is sorted.
-	size_t j = i;
-	struct ft save = ft[j];
-	do
-	    ft[j] = ft[j-1], j--;
-	while (j && fnamecmp(rpmbname, &ft[j-1], &save) > 0);
-	ft[j] = save;
-    }
+    // Check that either all dirnames are NULL or all are non-NULL.
+    for (size_t i = 1; i < n; i++)
+	if (!ft[i-1].dn ^ !ft[i].dn)
+	    die("some dirnames missing");
+    struct ft tmp;
+#define SWAP(i, j) tmp = ft[i], ft[i] = ft[j], ft[j] = tmp
+#define FLESS(i, j) fnamecmp(rpmbname, &ft[i], &ft[j]) < 0
+#define BLESS(i, j) strlencmp(ft[i].bn, ft[i].blen, ft[j].bn, ft[j].blen) < 0
+    if (ft[0].dn)
+	QSORT(n, FLESS, SWAP);
+    else
+	QSORT(n, BLESS, SWAP);
 }
 
 // Print a buffer to stdout.
