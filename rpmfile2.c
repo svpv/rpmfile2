@@ -168,7 +168,7 @@ static void *peek(struct rpmcpio *cpio, const struct cpioent *ent, void *arg)
 	bn = memcpy(xmalloc(blen + 1), ent->fname, blen + 1);
     }
     else {
-	bn = strrchr(ent->fname, '/') + 1;
+	bn = memrchr(ent->fname, '/', ent->fnamelen) + 1;
 	dlen = bn - ent->fname;
 	blen = ent->fnamelen - dlen;
 	if (ent->no && f[-1].dlen == dlen
